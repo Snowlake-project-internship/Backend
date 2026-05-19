@@ -9,6 +9,7 @@ class RegisterRequest(BaseModel):
     username: str = Field(validation_alias=AliasChoices("username", "name"), min_length=2)
     email: EmailStr
     password: str
+    organization_name: str | None = None
 
 
 class LoginRequest(BaseModel):
@@ -22,4 +23,6 @@ class UserResponse(BaseModel):
     id: int
     username: str
     email: EmailStr
+    organization_id: int | None = None
+    role: str = "user"
     created_at: datetime

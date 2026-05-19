@@ -25,6 +25,8 @@ def _serialize_user(user: User) -> dict:
         "id": user.id,
         "username": user.username,
         "email": user.email,
+        "organization_id": user.organization_id,
+        "role": user.role,
         "created_at": user.created_at,
     }
 

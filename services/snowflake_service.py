@@ -7,6 +7,18 @@ from typing import Any, Iterable, Optional
 import pandas as pd
 import snowflake.connector
 from dotenv import load_dotenv
+from logs.constants import LogLevel, OperationType
+from logs.service import LoggerService
+from logs.utils import (
+    duration_ms,
+    error_path_from_exception,
+    exception_type_name,
+    function_name_from_exception,
+    infer_operation_type,
+    infer_table_name,
+    now_ms,
+    stacktrace_from_exception,
+)
 from pandas.api import types as pdt
 from snowflake.connector import SnowflakeConnection
 from snowflake.connector.pandas_tools import write_pandas
@@ -21,6 +33,8 @@ class SnowflakeService:
         self.connection = self._connect()
         self.current_database: Optional[str] = None
         self.current_schema: Optional[str] = None
+        self.actor_user_id: Optional[int] = None
+        self.actor_organization_id: Optional[int] = None
         self.viewer_role = os.getenv("SNOWFLAKE_VIEWER_ROLE", "ACCOUNTADMIN")
 
     def _connect(self) -> SnowflakeConnection:
@@ -46,24 +60,101 @@ class SnowflakeService:
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
 
+    def set_actor(self, *, user_id: Optional[int] = None, organization_id: Optional[int] = None) -> None:
+        self.actor_user_id = user_id
+        self.actor_organization_id = organization_id
+
     @staticmethod
     def quote_identifier(identifier: str) -> str:
         return f'"{identifier.replace(chr(34), chr(34) + chr(34))}"'
 
-    def execute_query(self, query: str, params: Optional[Iterable[Any] | dict[str, Any]] = None) -> list[tuple[Any, ...]]:
+    def execute_query(
+        self,
+        query: str,
+        params: Optional[Iterable[Any] | dict[str, Any]] = None,
+        *,
+        operation_type: Optional[str] = None,
+        table_name: Optional[str] = None,
+    ) -> list[tuple[Any, ...]]:
         logger.debug("Executing Snowflake query: %s", query)
         cursor = self.connection.cursor()
+        start = now_ms()
+        operation_type = operation_type or infer_operation_type(query)
+        table_name = table_name or infer_table_name(query)
+        snowflake_query_id = None
         try:
             cursor.execute(query, params)
+            snowflake_query_id = getattr(cursor, "sfqid", None)
             if cursor.description:
-                return cursor.fetchall()
-            return []
+                rows = cursor.fetchall()
+            else:
+                rows = []
+            LoggerService.log_success(
+                operation_type=operation_type,
+                user_id=self.actor_user_id,
+                organization_id=self.actor_organization_id,
+                database_name=self.current_database,
+                schema_name=self.current_schema,
+                service_name="SnowflakeService",
+                table_name=table_name,
+                query_text=query,
+                snowflake_query_id=snowflake_query_id,
+                rows_affected=getattr(cursor, "rowcount", None),
+                duration_ms=duration_ms(start),
+                message="Snowflake query executed successfully",
+            )
+            return rows
+        except Exception as exc:
+            snowflake_query_id = getattr(cursor, "sfqid", None)
+            elapsed_ms = duration_ms(start)
+            error_path = error_path_from_exception(exc, "services/snowflake_service.py -> execute_query()")
+            function_name = function_name_from_exception(exc, "execute_query")
+            execution_log_id = LoggerService.log_failure(
+                operation_type=operation_type,
+                user_id=self.actor_user_id,
+                organization_id=self.actor_organization_id,
+                database_name=self.current_database,
+                schema_name=self.current_schema,
+                service_name="SnowflakeService",
+                table_name=table_name,
+                query_text=query,
+                snowflake_query_id=snowflake_query_id,
+                duration_ms=elapsed_ms,
+                error_message=str(exc),
+                error_path=error_path,
+            )
+            LoggerService.log_error(
+                LoggerService.error_from_context(
+                    execution_log_id=execution_log_id,
+                    user_id=self.actor_user_id,
+                    organization_id=self.actor_organization_id,
+                    operation_type=operation_type,
+                    level=LogLevel.ERROR,
+                    service_name="SnowflakeService",
+                    error_type=exception_type_name(exc),
+                    exception_type=exception_type_name(exc),
+                    error_message=str(exc),
+                    error_path=error_path,
+                    function_name=function_name,
+                    stacktrace=stacktrace_from_exception(exc),
+                    query_text=query,
+                    snowflake_query_id=snowflake_query_id,
+                    details={
+                        "database": self.current_database,
+                        "schema": self.current_schema,
+                        "table": table_name,
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+            )
+            raise
         finally:
             cursor.close()
 
     def create_database(self, database_name: str) -> None:
         self.execute_query(
-            f"CREATE DATABASE IF NOT EXISTS {self.quote_identifier(database_name)}"
+            f"CREATE DATABASE IF NOT EXISTS {self.quote_identifier(database_name)}",
+            operation_type=OperationType.CREATE_DATABASE,
         )
         self.grant_database_usage(database_name)
 
@@ -73,7 +164,8 @@ class SnowflakeService:
 
     def create_schema(self, schema_name: str) -> None:
         self.execute_query(
-            f"CREATE SCHEMA IF NOT EXISTS {self.quote_identifier(schema_name)}"
+            f"CREATE SCHEMA IF NOT EXISTS {self.quote_identifier(schema_name)}",
+            operation_type=OperationType.CREATE_SCHEMA,
         )
         self.grant_schema_usage(schema_name)
 
@@ -130,7 +222,9 @@ class SnowflakeService:
             f"""
             CREATE TABLE IF NOT EXISTS {self.quote_identifier(table_name)}
             ({", ".join(columns_sql)})
-            """
+            """,
+            operation_type=OperationType.CREATE_TABLE,
+            table_name=table_name,
         )
         self.grant_table_select(table_name)
 
@@ -181,6 +275,7 @@ class SnowflakeService:
         if not self.current_database or not self.current_schema:
             raise RuntimeError("Database and schema must be selected before inserting data.")
 
+        start = now_ms()
         prepared = dataframe.copy()
         prepared = prepared.where(pd.notnull(prepared), None)
         for column in prepared.columns:
@@ -188,16 +283,73 @@ class SnowflakeService:
                 prepared[column] = prepared[column].map(
                     lambda value: None if value is None else str(value)
                 )
-        success, _, row_count, _ = write_pandas(
-            conn=self.connection,
-            df=prepared,
-            table_name=table_name,
-            database=self.current_database,
-            schema=self.current_schema,
-            quote_identifiers=True,
-            auto_create_table=False,
-        )
-        if not success:
-            raise RuntimeError(f"Snowflake failed to insert rows into table {table_name}.")
+        try:
+            success, _, row_count, _ = write_pandas(
+                conn=self.connection,
+                df=prepared,
+                table_name=table_name,
+                database=self.current_database,
+                schema=self.current_schema,
+                quote_identifiers=True,
+                auto_create_table=False,
+            )
+            if not success:
+                raise RuntimeError(f"Snowflake failed to insert rows into table {table_name}.")
 
-        return int(row_count)
+            inserted_rows = int(row_count)
+            LoggerService.log_success(
+                operation_type=OperationType.INSERT,
+                user_id=self.actor_user_id,
+                organization_id=self.actor_organization_id,
+                database_name=self.current_database,
+                schema_name=self.current_schema,
+                service_name="SnowflakeService",
+                table_name=table_name,
+                rows_affected=inserted_rows,
+                duration_ms=duration_ms(start),
+                message=f"Inserted {inserted_rows} rows into {table_name}",
+                details={"columns": [str(column) for column in dataframe.columns]},
+            )
+            return inserted_rows
+        except Exception as exc:
+            elapsed_ms = duration_ms(start)
+            error_path = error_path_from_exception(exc, "services/snowflake_service.py -> insert_dataframe()")
+            function_name = function_name_from_exception(exc, "insert_dataframe")
+            execution_log_id = LoggerService.log_failure(
+                operation_type=OperationType.INSERT,
+                user_id=self.actor_user_id,
+                organization_id=self.actor_organization_id,
+                database_name=self.current_database,
+                schema_name=self.current_schema,
+                service_name="SnowflakeService",
+                table_name=table_name,
+                rows_affected=0,
+                duration_ms=elapsed_ms,
+                error_message=str(exc),
+                error_path=error_path,
+                details={"dataframe_rows": int(len(dataframe))},
+            )
+            LoggerService.log_error(
+                LoggerService.error_from_context(
+                    execution_log_id=execution_log_id,
+                    user_id=self.actor_user_id,
+                    organization_id=self.actor_organization_id,
+                    operation_type=OperationType.INSERT,
+                    level=LogLevel.ERROR,
+                    service_name="SnowflakeService",
+                    error_type=exception_type_name(exc),
+                    exception_type=exception_type_name(exc),
+                    error_message=str(exc),
+                    error_path=error_path,
+                    function_name=function_name,
+                    stacktrace=stacktrace_from_exception(exc),
+                    details={
+                        "database": self.current_database,
+                        "schema": self.current_schema,
+                        "table": table_name,
+                        "dataframe_rows": int(len(dataframe)),
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+            )
+            raise

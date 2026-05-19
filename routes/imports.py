@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from database import get_db
+from models.user import User
 from schemas.import_file import (
     ImportAnalyzeResponse,
     ImportConfirmRequest,
@@ -20,6 +21,7 @@ from services.import_service import (
     import_excel_to_snowflake,
     list_import_history,
 )
+from services.auth_service import get_optional_current_user
 from services.snowflake_service import SnowflakeService
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,7 @@ async def upload_import(
     file: UploadFile = File(...),
     entreprise_name: str = Form(...),
     user_id: Optional[int] = Form(None),
+    current_user: User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
     snowflake: SnowflakeService = Depends(get_snowflake_service),
 ) -> ImportUploadResponse:
@@ -69,6 +72,9 @@ async def upload_import(
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded Excel file is empty.")
 
+    # JWT is the source of truth. The form user_id remains only for old clients
+    # that have not been upgraded to send Authorization headers yet.
+    effective_user_id = current_user.id if current_user else user_id
     try:
         result = await run_in_threadpool(
             import_excel_to_snowflake,
@@ -77,7 +83,7 @@ async def upload_import(
             file_bytes=file_bytes,
             original_filename=file.filename,
             entreprise_name=entreprise_name.strip(),
-            user_id=user_id,
+            user_id=effective_user_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -106,6 +112,7 @@ async def analyze_import(
     file: UploadFile = File(...),
     entreprise_name: str = Form(...),
     user_id: Optional[int] = Form(None),
+    current_user: User | None = Depends(get_optional_current_user),
 ) -> ImportAnalyzeResponse:
     _validate_excel_upload(file)
 
@@ -116,13 +123,14 @@ async def analyze_import(
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded Excel file is empty.")
 
+    effective_user_id = current_user.id if current_user else user_id
     try:
         result = await run_in_threadpool(
             analyze_excel_import,
             file_bytes=file_bytes,
             original_filename=file.filename,
             entreprise_name=entreprise_name.strip(),
-            user_id=user_id,
+            user_id=effective_user_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -136,16 +144,18 @@ async def analyze_import(
 @router.post("/confirm", response_model=ImportUploadResponse, status_code=status.HTTP_201_CREATED)
 async def confirm_import(
     request: ImportConfirmRequest,
+    current_user: User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
     snowflake: SnowflakeService = Depends(get_snowflake_service),
 ) -> ImportUploadResponse:
+    effective_user_id = current_user.id if current_user else request.user_id
     try:
         result = await run_in_threadpool(
             import_cached_session,
             db=db,
             snowflake=snowflake,
             session_id=request.session_id,
-            user_id=request.user_id,
+            user_id=effective_user_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -169,6 +179,8 @@ async def confirm_import(
 @router.get("/history", response_model=list[ImportFileResponse])
 def import_history(
     user_id: Optional[int] = None,
+    current_user: User | None = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
-    return list_import_history(db, user_id=user_id)
+    effective_user_id = current_user.id if current_user else user_id
+    return list_import_history(db, user_id=effective_user_id)
