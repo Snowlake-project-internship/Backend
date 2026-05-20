@@ -18,6 +18,7 @@ from routes.auth import router as auth_router
 from routes.chat import router as chat_router
 from routes.dashboard import router as dashboard_router
 from routes.imports import router as imports_router
+from routes.logfiles import router as logfiles_router
 from routes.logs import router as logs_router
 from routes.snowflake import router as snowflake_router
 from routes.users import router as users_router
@@ -76,6 +77,7 @@ app.include_router(imports_router, prefix="/api/imports", tags=["imports"])
 app.include_router(dashboard_router, prefix="/api/dashboard", tags=["dashboard"])
 app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
 app.include_router(logs_router, prefix="/api/logs", tags=["logs"])
+app.include_router(logfiles_router, prefix="/api/logfiles", tags=["logfiles"])
 app.include_router(snowflake_router, prefix="/api/snowflake", tags=["snowflake"])
 
 
